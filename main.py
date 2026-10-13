@@ -7,8 +7,11 @@
 
 数据来源为 Bangumi 公开 API（默认 https://api.bgm.tv）。
 如果所在网络无法直连，在插件配置里把 api_base 指向可用的反向代理地址即可。
-判定口径：收藏条目的 updated_at 落在「今天」，即该用户今天在 Bangumi 上有过动作。
+判定口径：收藏条目的 updated_at 落在目标日期，即该用户当天在 Bangumi 上有过动作。
 接口默认按 updated_at 倒序返回，因此只需拉前若干页即可覆盖当天动态。
+
+日期参数：所有查询命令都支持在末尾加 `-N` 指定「往前第 N 天」，
+  -0（默认）今天、-1 昨天、-2 前天……依次递推。
 """
 
 from __future__ import annotations
@@ -42,6 +45,9 @@ SUBJECT_LABEL = {1: "书籍", 2: "动画", 3: "音乐", 4: "游戏", 5: "三次�
 PAGE_SIZE = 30
 MAX_ITEMS_PER_USER = 20
 MAX_ITEMS_PER_USER_IN_REPORT = 6
+# 拉取分页的上限。查历史日期时可能需要多拉几页，
+# 但仍要留一个硬上限，避免单个用户把整份收藏都翻完。
+MAX_PAGES_HARD = 10
 
 HELP_TEXT = """Bangumi 群友动态
 
@@ -52,6 +58,10 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
 /bgm群报            汇总全群今天谁在追番
 /bgm帮助            显示这条帮助
+
+日期参数：以上查询命令都可加 -N 看更早的动态
+  -0 今天（默认）、-1 昨天、-2 前天……依次递推
+  例如：/bgm我 -1        /bgm查 @群友 -3      /bgm群报 -7
 
 用户名就是 bgm.tv/user/<这一段>，例如 /bgm绑定 sai
 只能读取公开收藏，若提示查不到请到 Bangumi 设置里把收藏改为公开。"""
@@ -68,8 +78,8 @@ class UserNotFound(BangumiError):
 @register(
     PLUGIN_NAME,
     "Anorakz",
-    "绑定群友 Bangumi 账号，查询今日追番动态与全群汇总",
-    "v1.0.0",
+    "绑定群友 Bangumi 账号，查询追番动态与全群汇总（支持 -N 指定天数）",
+    "v1.1.0",
 )
 class BangumiGroupPlugin(Star):
     _CMD_WORDS = {
@@ -185,16 +195,29 @@ class BangumiGroupPlugin(Star):
             raise UserNotFound(username)
         return data
 
-    async def _fetch_collections(self, username: str) -> list[dict]:
-        """拉取收藏列表（接口按 updated_at 倒序，故只需前面几页）。"""
-        now = time.time()
-        cached = self._cache.get(username)
-        if cached and now - cached[0] < self.cache_ttl:
-            return cached[1]
+    async def _fetch_collections(self, username: str, day_offset: int = 0) -> list[dict]:
+        """拉取收藏列表（接口按 updated_at 倒序，故只需前面几页）。
 
-        today_start = self._now().replace(hour=0, minute=0, second=0, microsecond=0)
+        day_offset 表示需要覆盖到「往前第几天」：0 拉到今天为止，
+        1 表示需要覆盖到昨天，以此类推（内部统一存正数深度）。
+        缓存记录 (拉取时刻, 条目, 已覆盖深度)，只要缓存还新鲜
+        且上次覆盖的深度 >= 本次所需深度，就直接复用。
+        """
+        now = time.time()
+        need = max(0, int(day_offset))
+        wanted_start = self._day_start(need)
+
+        cached = self._cache.get(username)
+        if cached:
+            stamp, cached_items, covered_depth = cached
+            fresh = now - stamp < self.cache_ttl
+            if fresh and covered_depth >= need:
+                return cached_items
+
         items: list[dict] = []
-        for page in range(self.max_pages):
+        covered_depth = need
+        pages_budget = max(self.max_pages, min(MAX_PAGES_HARD, self.max_pages + need))
+        for page in range(pages_budget):
             data = await self._api_get(
                 f"/v0/users/{quote(username)}/collections",
                 {"limit": PAGE_SIZE, "offset": page * PAGE_SIZE},
@@ -202,22 +225,43 @@ class BangumiGroupPlugin(Star):
             batch = (data or {}).get("data") or []
             items.extend(batch)
             if len(batch) < PAGE_SIZE:
+                # 拉完了全部收藏，覆盖范围足够深
+                covered_depth = MAX_PAGES_HARD * 10
                 break
             tail = self._parse_iso(batch[-1].get("updated_at"))
-            if tail is not None and tail.astimezone(self.tz) < today_start:
+            if tail is not None and tail.astimezone(self.tz) < wanted_start:
+                # 尾条已经早于目标日期，说明所需区间已完整覆盖
                 break
+        else:
+            # 页数用尽仍未触及目标日期，如实记录覆盖不到那么深
+            covered_depth = need - 1 if need > 0 else 0
 
-        self._cache[username] = (now, items)
+        self._cache[username] = (now, items, covered_depth)
         return items
 
-    def _today_items(self, items: list[dict]) -> list[dict]:
-        today = self._now().date()
+    def _day_start(self, day_offset: int) -> dt.datetime:
+        """返回「往前第 day_offset 天」当天 00:00（带时区）。"""
+        base = self._now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return base - dt.timedelta(days=max(0, int(day_offset)))
+
+    def _day_items(self, items: list[dict], day_offset: int = 0) -> list[dict]:
+        """筛出目标日期当天的条目。"""
+        target = self._day_start(day_offset).date()
         result = []
         for item in items:
             stamp = self._parse_iso(item.get("updated_at"))
-            if stamp is not None and stamp.astimezone(self.tz).date() == today:
+            if stamp is not None and stamp.astimezone(self.tz).date() == target:
                 result.append(item)
         return result
+
+    def _day_label(self, day_offset: int) -> str:
+        """人类可读的日期标签：今天 / 昨天 / 前天 / MM-DD。"""
+        day = self._day_start(day_offset).date()
+        mapping = {0: "今天", 1: "昨天", 2: "前天"}
+        if day_offset in mapping:
+            return mapping[day_offset]
+        weekday = "一二三四五六日"[day.weekday()]
+        return f"{day:%m-%d}（周{weekday}）"
 
     @staticmethod
     def _subject_name(item: dict) -> tuple[str, str]:
@@ -305,6 +349,31 @@ class BangumiGroupPlugin(Star):
         return parts
 
     @staticmethod
+    def _parse_day_offset(args: list[str]) -> tuple[int, list[str]]:
+        """从参数里挑出 -N 天数偏移，返回 (offset, 剩余参数)。
+
+        兼容全角减号、中文破折号，以及 `- 3` 这类被空格分开的写法。
+        """
+        offset = 0
+        rest: list[str] = []
+        index = 0
+        while index < len(args):
+            token = args[index].strip()
+            normalized = token.replace("－", "-").replace("—", "-").replace("–", "-")
+            value: int | None = None
+            if normalized.startswith("-") and len(normalized) > 1 and normalized[1:].isdigit():
+                value = int(normalized[1:])
+            elif normalized == "-" and index + 1 < len(args) and args[index + 1].strip().isdigit():
+                value = int(args[index + 1].strip())
+                index += 1
+            if value is not None:
+                offset = max(0, value)
+            else:
+                rest.append(token)
+            index += 1
+        return offset, rest
+
+    @staticmethod
     def _extract_target_id(event: AstrMessageEvent) -> str:
         for component in event.get_messages():
             if isinstance(component, At):
@@ -315,23 +384,26 @@ class BangumiGroupPlugin(Star):
 
     # ── 渲染 ────────────────────────────────────────────────
 
-    async def _render_user_today(self, username: str, title: str) -> str:
+    async def _render_user_day(
+        self, username: str, title: str, day_offset: int = 0
+    ) -> str:
+        day_label = self._day_label(day_offset)
         try:
-            items = await self._fetch_collections(username)
+            items = await self._fetch_collections(username, day_offset)
         except UserNotFound:
             return f"❌ 找不到 Bangumi 用户「{username}」，可能已改名或注销。"
         except BangumiError as exc:
             return f"❌ 查询「{username}」失败：{exc}"
 
-        today_items = self._today_items(items)
-        if not today_items:
-            return f"📭 {title}没有新动态。"
+        day_items = self._day_items(items, day_offset)
+        if not day_items:
+            return f"📭 {title}{day_label}没有新动态。"
 
-        lines = [f"📖 {title}有 {len(today_items)} 条动态："]
-        for item in today_items[:MAX_ITEMS_PER_USER]:
+        lines = [f"📖 {title}{day_label}有 {len(day_items)} 条动态："]
+        for item in day_items[:MAX_ITEMS_PER_USER]:
             lines.append("  · " + self._format_item(item))
-        if len(today_items) > MAX_ITEMS_PER_USER:
-            lines.append(f"  …… 还有 {len(today_items) - MAX_ITEMS_PER_USER} 条")
+        if len(day_items) > MAX_ITEMS_PER_USER:
+            lines.append(f"  …… 还有 {len(day_items) - MAX_ITEMS_PER_USER} 条")
         return "\n".join(lines)
 
     # ── 命令 ────────────────────────────────────────────────
@@ -399,27 +471,28 @@ class BangumiGroupPlugin(Star):
                 "你还没有绑定 Bangumi 账号。\n用法：/bgm绑定 <用户名>"
             )
             return
+        day_offset, _ = self._parse_day_offset(self._args(event))
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
-            await self._render_user_today(binding["username"], f"你（{label}）今天")
+            await self._render_user_day(binding["username"], f"你（{label}）", day_offset)
         )
 
     @filter.command("bgm查", alias={"bgm_query"})
     async def query(self, event: AstrMessageEvent):
         scope = self._scope_id(event)
         target = self._extract_target_id(event)
-        args = self._args(event)
-
-        if not target and not args:
-            yield event.plain_result(
-                "用法：/bgm查 @群友   或   /bgm查 <Bangumi 用户名>"
-            )
-            return
+        day_offset, args = self._parse_day_offset(self._args(event))
 
         if not target:
+            if not args:
+                yield event.plain_result(
+                    "用法：/bgm查 @群友 [-N]   或   /bgm查 <Bangumi 用户名> [-N]\n"
+                    "N 可选：-0 今天（默认）、-1 昨天、-2 前天……依次递推"
+                )
+                return
             keyword = args[0].strip().lstrip("@")
             yield event.plain_result(
-                await self._render_user_today(keyword, f"{keyword} 今天")
+                await self._render_user_day(keyword, f"{keyword} ", day_offset)
             )
             return
 
@@ -429,12 +502,15 @@ class BangumiGroupPlugin(Star):
             return
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
-            await self._render_user_today(binding["username"], f"{label} 今天")
+            await self._render_user_day(binding["username"], f"{label} ", day_offset)
         )
 
     @filter.command("bgm群报", alias={"bgm_group", "群报"})
     async def group_report(self, event: AstrMessageEvent):
         scope = self._scope_id(event)
+        day_offset, _ = self._parse_day_offset(self._args(event))
+        day_label = self._day_label(day_offset)
+
         bindings = self._list_bindings(scope)
         if not bindings:
             yield event.plain_result(
@@ -442,7 +518,9 @@ class BangumiGroupPlugin(Star):
             )
             return
 
-        yield event.plain_result(f"🔍 正在统计 {len(bindings)} 位群友的今日动态…")
+        yield event.plain_result(
+            f"🔍 正在统计 {len(bindings)} 位群友{day_label}的动态…"
+        )
 
         active: list[str] = []
         quiet: list[str] = []
@@ -451,7 +529,7 @@ class BangumiGroupPlugin(Star):
         for index, binding in enumerate(bindings):
             label = binding.get("display") or binding["username"]
             try:
-                items = await self._fetch_collections(binding["username"])
+                items = await self._fetch_collections(binding["username"], day_offset)
             except UserNotFound:
                 errors.append(f"{label}（用户不存在）")
                 continue
@@ -459,16 +537,16 @@ class BangumiGroupPlugin(Star):
                 errors.append(f"{label}（{exc}）")
                 continue
 
-            today_items = self._today_items(items)
-            if not today_items:
+            day_items = self._day_items(items, day_offset)
+            if not day_items:
                 quiet.append(label)
             else:
-                block = [f"▸ {label} · {len(today_items)} 条"]
-                for item in today_items[:MAX_ITEMS_PER_USER_IN_REPORT]:
+                block = [f"▸ {label} · {len(day_items)} 条"]
+                for item in day_items[:MAX_ITEMS_PER_USER_IN_REPORT]:
                     block.append("    " + self._format_item(item))
-                if len(today_items) > MAX_ITEMS_PER_USER_IN_REPORT:
+                if len(day_items) > MAX_ITEMS_PER_USER_IN_REPORT:
                     block.append(
-                        f"    …… 还有 {len(today_items) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
+                        f"    …… 还有 {len(day_items) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
                     )
                 active.append("\n".join(block))
 
@@ -476,15 +554,15 @@ class BangumiGroupPlugin(Star):
                 await asyncio.sleep(self.query_delay)
 
         now = self._now()
-        lines = [f"📊 Bangumi 群报 · {now:%m-%d}", f"本群已绑定 {len(bindings)} 人", ""]
+        lines = [f"📊 Bangumi 群报 · {now:%m-%d} · {day_label}", f"本群已绑定 {len(bindings)} 人", ""]
         if active:
-            lines.append(f"今天有动态：{len(active)} 人")
+            lines.append(f"{day_label}有动态：{len(active)} 人")
             lines.extend(active)
         else:
-            lines.append("今天大家都还没有动静。")
+            lines.append(f"{day_label}大家都还没有动静。")
         if quiet:
             lines.append("")
-            lines.append(f"今天无动态：{'、'.join(quiet)}")
+            lines.append(f"{day_label}无动态：{'、'.join(quiet)}")
         if errors:
             lines.append("")
             lines.append(f"查询失败：{'、'.join(errors)}")
