@@ -7,8 +7,17 @@
 
 数据来源为 Bangumi 公开 API（默认 https://api.bgm.tv）。
 如果所在网络无法直连，在插件配置里把 api_base 指向可用的反向代理地址即可。
-判定口径：收藏条目的 updated_at 落在目标日期，即该用户当天在 Bangumi 上有过动作。
-接口默认按 updated_at 倒序返回，因此只需拉前若干页即可覆盖当天动态。
+
+★ 口径（重要，勿误解）
+  判定依据是收藏条目的 `updated_at` —— 即「这条收藏最后一次被改动的时间」。
+  Bangumi 公开接口**不提供单集观看记录**（/v0/users/{u}/collections 只有
+  一个笼统的 updated_at 和当前的 ep_status，没有「第 N 集是哪天看的」）。
+  因此：
+    · 一条番剧只会出现在它最后一次被改动的那一天
+    · 之后再次改动它，就会从原来那天「消失」（时间被覆盖）
+  这是接口能力边界，不是 bug。要逐集时间线只能看 Bangumi 网页。
+
+  接口按 updated_at 倒序返回，因此查某一天只需拉前几页即可覆盖。
 
 日期参数：所有查询命令都支持在末尾加 `-N` 指定「往前第 N 天」，
   -0（默认）今天、-1 昨天、-2 前天……依次递推。
@@ -62,6 +71,13 @@ HELP_TEXT = """Bangumi 群友动态
 日期参数：以上查询命令都可加 -N 看更早的动态
   -0 今天（默认）、-1 昨天、-2 前天……依次递推
   例如：/bgm我 -1        /bgm查 @群友 -3      /bgm群报 -7
+
+⚠️ 口径说明（重要）
+  本插件读的是「收藏条目的最后修改时间」，不是「第几集是哪天看的」。
+  Bangumi 公开接口不提供单集观看记录，所以：
+    · 一条番剧只会出现在它「最后一次被改动」的那一天
+    · 之后再次改动它（改评分/推进度），就会从原来那天消失
+  想要逐集时间线，只能去 Bangumi 网页自己看。
 
 用户名就是 bgm.tv/user/<这一段>，例如 /bgm绑定 sai
 只能读取公开收藏，若提示查不到请到 Bangumi 设置里把收藏改为公开。"""
@@ -269,7 +285,7 @@ class BangumiGroupPlugin(Star):
         name = subject.get("name_cn") or subject.get("name") or f"#{item.get('subject_id')}"
         return str(name), SUBJECT_LABEL.get(item.get("subject_type"), "")
 
-    def _format_item(self, item: dict) -> str:
+    def _format_item(self, item: dict, with_date: bool = False) -> str:
         name, kind = self._subject_name(item)
         bits: list[str] = []
 
@@ -286,7 +302,11 @@ class BangumiGroupPlugin(Star):
             bits.append("更新了收藏")
 
         stamp = self._parse_iso(item.get("updated_at"))
-        clock = f"{stamp.astimezone(self.tz):%H:%M} " if stamp else ""
+        if stamp:
+            local = stamp.astimezone(self.tz)
+            clock = f"{local:%m-%d %H:%M} " if with_date else f"{local:%H:%M} "
+        else:
+            clock = ""
         prefix = f"[{kind}] " if kind else ""
         return f"{clock}{prefix}《{name}》 {' · '.join(bits)}"
 
@@ -399,9 +419,11 @@ class BangumiGroupPlugin(Star):
         if not day_items:
             return f"📭 {title}{day_label}没有新动态。"
 
+        # 查历史日期时附上具体日期，避免同一个钟点看不出是哪天
+        with_date = day_offset > 0
         lines = [f"📖 {title}{day_label}有 {len(day_items)} 条动态："]
         for item in day_items[:MAX_ITEMS_PER_USER]:
-            lines.append("  · " + self._format_item(item))
+            lines.append("  · " + self._format_item(item, with_date=with_date))
         if len(day_items) > MAX_ITEMS_PER_USER:
             lines.append(f"  …… 还有 {len(day_items) - MAX_ITEMS_PER_USER} 条")
         return "\n".join(lines)
