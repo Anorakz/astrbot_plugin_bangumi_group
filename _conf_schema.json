@@ -1,0 +1,44 @@
+{
+  "api_base": {
+    "description": "Bangumi API 地址",
+    "type": "string",
+    "hint": "默认官方地址 https://api.bgm.tv。若该地址在你的网络中无法访问，改成你自己的 Bangumi API 反向代理地址即可，其余配置无需改动。",
+    "default": "https://api.bgm.tv"
+  },
+  "user_agent": {
+    "description": "请求头 User-Agent",
+    "type": "string",
+    "hint": "留空则使用插件默认值（含仓库地址，便于上游统计）",
+    "default": ""
+  },
+  "timezone": {
+    "description": "判定「今天」使用的时区",
+    "type": "string",
+    "hint": "IANA 时区名，默认 Asia/Shanghai",
+    "default": "Asia/Shanghai"
+  },
+  "cache_ttl": {
+    "description": "结果缓存秒数",
+    "type": "int",
+    "hint": "同一用户的收藏数据在这个时间内复用，避免重复请求上游；默认 300 秒",
+    "default": 300
+  },
+  "max_pages": {
+    "description": "每人最多翻几页收藏",
+    "type": "int",
+    "hint": "接口按更新时间倒序返回，每页 30 条。默认 2 页（60 条）足够覆盖当天动态；调大可覆盖更活跃的用户，但会更慢",
+    "default": 2
+  },
+  "query_delay": {
+    "description": "群报时每人之间的请求间隔（秒）",
+    "type": "float",
+    "hint": "避免短时间大量请求触发上游限流，默认 0.5 秒",
+    "default": 0.5
+  },
+  "admin_uids": {
+    "description": "管理员 QQ 列表",
+    "type": "list",
+    "hint": "列表内用户可强制解绑他人（留空则仅允许本人解绑自己）",
+    "default": []
+  }
+}

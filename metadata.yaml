@@ -1,0 +1,12 @@
+name: astrbot_plugin_bangumi_group
+display_name: Bangumi 群友动态
+desc: 让群友绑定自己的 Bangumi 账号，一键查询「今天谁在追番」——支持查单个群友的今日动态，也能汇总全群。
+version: v1.0.0
+author: Anorakz
+repo: https://github.com/Anorakz/astrbot_plugin_bangumi_group
+astrbot_version: ">=4.26.2,<5"
+tags:
+  - bangumi
+  - 追番
+  - 群友动态
+  - 娱乐
