@@ -64,7 +64,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm绑定 <用户名>   绑定你的 Bangumi 账号
 /bgm解绑            解除绑定
 /bgm我              看看我今天在追什么
-/bgm查 <昵称/用户名> 查绑定群友的动态（如 /bgm查 day）
+/bgm查 <名字>        按群昵称/昵称/用户名查绑定群友（如 /bgm查 day）
 /bgm群报            汇总全群今天谁在追番
 /bgm帮助            显示这条帮助
 
@@ -156,6 +156,7 @@ class BangumiGroupPlugin(Star):
                     user_id    TEXT NOT NULL,
                     username   TEXT NOT NULL,
                     display    TEXT,
+                    qq_name    TEXT,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (scope_id, user_id)
                 )
@@ -164,6 +165,10 @@ class BangumiGroupPlugin(Star):
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bindings_scope ON bindings(scope_id)"
             )
+            # 旧库迁移：补 qq_name 列（QQ 群昵称，随该用户使用命令时自动刷新）
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(bindings)")}
+            if "qq_name" not in cols:
+                conn.execute("ALTER TABLE bindings ADD COLUMN qq_name TEXT")
 
     def _now(self) -> dt.datetime:
         return dt.datetime.now(self.tz)
@@ -323,15 +328,38 @@ class BangumiGroupPlugin(Star):
             return f"group:{group_id}"
         return f"private:{event.get_sender_id()}"
 
-    def _upsert_binding(self, scope_id: str, user_id: str, username: str, display: str) -> None:
+    def _upsert_binding(
+        self,
+        scope_id: str,
+        user_id: str,
+        username: str,
+        display: str,
+        qq_name: str | None = None,
+    ) -> None:
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO bindings(scope_id, user_id, username, display, created_at) "
-                "VALUES(?, ?, ?, ?, ?) "
+                "INSERT INTO bindings(scope_id, user_id, username, display, qq_name, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(scope_id, user_id) DO UPDATE SET "
-                "username = excluded.username, display = excluded.display",
-                (scope_id, user_id, username, display, self._now().isoformat()),
+                "username = excluded.username, display = excluded.display, "
+                "qq_name = COALESCE(excluded.qq_name, bindings.qq_name)",
+                (scope_id, user_id, username, display, qq_name, self._now().isoformat()),
             )
+
+    def _refresh_qq_name(self, event: AstrMessageEvent, binding: dict) -> None:
+        """用发送者当前的群昵称刷新绑定记录（昵称改了也能被查到）。"""
+        try:
+            name = str(event.get_sender_name() or "").strip()
+        except Exception:
+            return
+        if not name or name == str(binding.get("qq_name") or ""):
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE bindings SET qq_name = ? WHERE scope_id = ? AND user_id = ?",
+                (name, binding["scope_id"], binding["user_id"]),
+            )
+        binding["qq_name"] = name
 
     def _delete_binding(self, scope_id: str, user_id: str) -> int:
         with self._conn() as conn:
@@ -350,19 +378,30 @@ class BangumiGroupPlugin(Star):
         return dict(row) if row else None
 
     def _find_binding_by_keyword(self, scope_id: str, keyword: str) -> dict | None:
-        """按绑定昵称或 Bangumi 用户名查绑定（优先本群 scope）。
+        """按 群昵称 → Bangumi昵称 → 用户名 的优先级匹配绑定（优先本群 scope）。
 
         官方平台(qq_official)的群消息不含 @其他群友 的提及信息，
-        `/bgm查 @群友` 无法拿到对方 openid；改用绑定表按名字命中，
-        `/bgm查 day`、`/bgm查 名字飞了` 这类写法因此可用。
+        `/bgm查 @群友` 无法拿到对方 openid；群昵称在绑定/使用命令时记录，
+        改了昵称也会在该用户下次使用命令时自动刷新。
         """
+        kw = keyword.strip().casefold()
+        if not kw:
+            return None
         with self._conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM bindings WHERE display = ? OR username = ? "
-                "ORDER BY (scope_id = ?) DESC LIMIT 1",
-                (keyword, keyword, scope_id),
-            ).fetchone()
-        return dict(row) if row else None
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM bindings "
+                    "ORDER BY (scope_id = ?) DESC, created_at ASC",
+                    (scope_id,),
+                )
+            ]
+        for field in ("qq_name", "display", "username"):
+            for row in rows:
+                value = str(row.get(field) or "").strip().casefold()
+                if value == kw:
+                    return row
+        return None
 
     def _list_bindings(self, scope_id: str) -> list[dict]:
         with self._conn() as conn:
@@ -495,8 +534,16 @@ class BangumiGroupPlugin(Star):
 
         username = str(profile.get("username") or keyword)
         display = str(profile.get("nickname") or username)
+        try:
+            qq_name = str(event.get_sender_name() or "").strip()
+        except Exception:
+            qq_name = ""
         self._upsert_binding(
-            self._scope_id(event), self._sender_id(event), username, display
+            self._scope_id(event),
+            self._sender_id(event),
+            username,
+            display,
+            qq_name,
         )
         yield event.plain_result(
             f"✅ 绑定成功\n"
@@ -533,6 +580,7 @@ class BangumiGroupPlugin(Star):
                 "你还没有绑定 Bangumi 账号。\n用法：/bgm绑定 <用户名>"
             )
             return
+        self._refresh_qq_name(event, binding)
         day_offset, _ = self._parse_day_offset(self._args(event))
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
@@ -548,14 +596,15 @@ class BangumiGroupPlugin(Star):
         if not target:
             if not args:
                 yield event.plain_result(
-                    "用法：/bgm查 @群友 [-N]   或   /bgm查 <Bangumi 用户名> [-N]\n"
+                    "用法：/bgm查 <群昵称 | 昵称 | 用户名> [-N]\n"
                     "N 可选：-0 今天（默认）、-1 昨天、-2 前天……依次递推"
                 )
                 return
             keyword = args[0].strip().lstrip("@")
-            # 先按绑定昵称/用户名命中（官方平台 @群友 拿不到 openid 的替代方案）
+            # 按 群昵称→昵称→用户名 命中（官方平台 @群友 拿不到 openid 的替代方案）
             by_keyword = self._find_binding_by_keyword(scope, keyword)
             if by_keyword:
+                self._refresh_qq_name(event, by_keyword)
                 label = by_keyword.get("display") or by_keyword["username"]
                 yield event.plain_result(
                     await self._render_user_day(
@@ -564,7 +613,8 @@ class BangumiGroupPlugin(Star):
                 )
                 return
             yield event.plain_result(
-                await self._render_user_day(keyword, f"{keyword} ", day_offset)
+                f"「{keyword}」还没有绑定 Bangumi 账号。\n"
+                "让 TA 私聊机器人发 /bgm绑定 <Bangumi用户名> 即可。"
             )
             return
 
@@ -572,6 +622,7 @@ class BangumiGroupPlugin(Star):
         if not binding:
             yield event.plain_result(f"{target} 还没有绑定 Bangumi 账号。")
             return
+        self._refresh_qq_name(event, binding)
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
             await self._render_user_day(binding["username"], f"{label} ", day_offset)
