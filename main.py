@@ -602,7 +602,6 @@ class BangumiGroupPlugin(Star):
 
     # ── 命令 ────────────────────────────────────────────────
 
-    @filter.command("bgm绑定", alias={"bgm_bind", "绑定bgm"})
     async def _resolve_query_key(self, profile: dict, keyword: str) -> str:
         """选出对该用户真正可用的查询键。
 
@@ -626,6 +625,7 @@ class BangumiGroupPlugin(Star):
                 continue
         return candidates[0] if candidates else keyword
 
+    @filter.command("bgm绑定", alias={"bgm_bind", "绑定bgm"})
     async def bind(self, event: AstrMessageEvent):
         args = self._args(event)
         if not args:
