@@ -49,7 +49,7 @@ DEFAULT_UA = (
     "(https://github.com/Anorakz/astrbot_plugin_bangumi_group)"
 )
 
-COLLECT_LABEL = {1: "看过", 2: "想看", 3: "在看", 4: "搁置", 5: "抛弃"}
+COLLECT_LABEL = {1: "想看", 2: "看过", 3: "在看", 4: "搁置", 5: "抛弃"}
 SUBJECT_LABEL = {1: "书籍", 2: "动画", 3: "音乐", 4: "游戏", 5: "三次元", 6: "影视"}
 
 PAGE_SIZE = 30
