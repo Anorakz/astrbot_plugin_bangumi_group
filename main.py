@@ -64,8 +64,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm绑定 <用户名>   绑定你的 Bangumi 账号
 /bgm解绑            解除绑定
 /bgm我              看看我今天在追什么
-/bgm查 @群友        看某位群友今天的动态
-/bgm查 <用户名>     直接查任意账号（无需绑定）
+/bgm查 <昵称/用户名> 查绑定群友的动态（如 /bgm查 day）
 /bgm群报            汇总全群今天谁在追番
 /bgm帮助            显示这条帮助
 
@@ -350,6 +349,21 @@ class BangumiGroupPlugin(Star):
             ).fetchone()
         return dict(row) if row else None
 
+    def _find_binding_by_keyword(self, scope_id: str, keyword: str) -> dict | None:
+        """按绑定昵称或 Bangumi 用户名查绑定（优先本群 scope）。
+
+        官方平台(qq_official)的群消息不含 @其他群友 的提及信息，
+        `/bgm查 @群友` 无法拿到对方 openid；改用绑定表按名字命中，
+        `/bgm查 day`、`/bgm查 名字飞了` 这类写法因此可用。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM bindings WHERE display = ? OR username = ? "
+                "ORDER BY (scope_id = ?) DESC LIMIT 1",
+                (keyword, keyword, scope_id),
+            ).fetchone()
+        return dict(row) if row else None
+
     def _list_bindings(self, scope_id: str) -> list[dict]:
         with self._conn() as conn:
             rows = conn.execute(
@@ -404,17 +418,22 @@ class BangumiGroupPlugin(Star):
         且 @ 其他群友不会生成 At 组件，而是以 `<@!openid>` 文本形式
         残留在 message_str 里，需要自行解析（openid 恰好是绑定表的 user_id）。
         """
-        self_id = str(getattr(event, "self_id", "") or "")
+        try:
+            self_id = str(event.get_self_id() or "")
+        except Exception:
+            self_id = str(getattr(event, "self_id", "") or "")
         for component in event.get_messages():
             if isinstance(component, At):
                 qq = getattr(component, "qq", None)
                 if qq is None:
                     continue
                 qq = str(qq)
-                if qq in {"all", "0", "-1"}:
+                # "qq_official" 是官方适配器合成的「@机器人」标记
+                # （C2C 路径 self_id 是 "unknown_selfid"，与 At.qq 对不上）
+                if qq in {"all", "0", "-1", "qq_official"}:
                     continue
                 if self_id and qq == self_id:
-                    continue  # 官方平台：每条群消息自带的「@机器人」组件
+                    continue  # 官方平台群聊：@机器人自身的组件
                 return qq
         m = re.search(r"<@!?(\w+)", getattr(event, "message_str", "") or "")
         if m:
@@ -534,6 +553,16 @@ class BangumiGroupPlugin(Star):
                 )
                 return
             keyword = args[0].strip().lstrip("@")
+            # 先按绑定昵称/用户名命中（官方平台 @群友 拿不到 openid 的替代方案）
+            by_keyword = self._find_binding_by_keyword(scope, keyword)
+            if by_keyword:
+                label = by_keyword.get("display") or by_keyword["username"]
+                yield event.plain_result(
+                    await self._render_user_day(
+                        by_keyword["username"], f"{label} ", day_offset
+                    )
+                )
+                return
             yield event.plain_result(
                 await self._render_user_day(keyword, f"{keyword} ", day_offset)
             )
