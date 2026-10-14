@@ -59,6 +59,7 @@ MAX_ITEMS_PER_USER_IN_REPORT = 6
 # 拉取分页的上限。查历史日期时可能需要多拉几页，
 # 但仍要留一个硬上限，避免单个用户把整份收藏都翻完。
 MAX_PAGES_HARD = 10
+SEASON_CACHE_TTL = 6 * 3600  # 当季放送表缓存（秒）
 
 HELP_TEXT = """Bangumi 群友动态
 
@@ -69,7 +70,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
 /bgm群报            汇总全群今天谁在追番
 /bgm群报订阅 [小时] 每天定时推送群报（默认23:00；取消加「取消」）
-/番剧排名 [0|1]     群友追番排行前三（0=今天 默认；1=本周）
+/番剧排名 [0|1|2]    群友追番排行前三（0今天 1本周 2本季新番）
 /bgm帮助            显示这条帮助
 
 日期参数：以上查询命令都可加 -N 看更早的动态
@@ -134,6 +135,7 @@ class BangumiGroupPlugin(Star):
         self.db_path = data_dir / "bindings.db"
 
         self._cache: dict[str, tuple[float, list[dict]]] = {}
+        self._season_cache: tuple[float, set[str]] | None = None
         self._session: aiohttp.ClientSession | None = None
         self._report_task: asyncio.Task | None = None
         self._init_db()
@@ -292,15 +294,44 @@ class BangumiGroupPlugin(Star):
                 result.append(item)
         return result
 
+    def _season_start(self) -> dt.datetime:
+        """当前季度起始日 00:00（1/4/7/10 月 1 号）。"""
+        now = self._now()
+        first_month = ((now.month - 1) // 3) * 3 + 1
+        return dt.datetime(now.year, first_month, 1, tzinfo=self.tz)
+
     def _window_start(self, kind: int) -> dt.datetime:
-        """统计窗口起点：0=今天 00:00；1=本周一 00:00。"""
-        today = self._day_start(0)
-        if int(kind) == 1:
+        """统计窗口起点：0=今天 00:00；1=本周一 00:00；2=本季度首日 00:00。"""
+        kind = int(kind)
+        if kind == 1:
+            today = self._day_start(0)
             return today - dt.timedelta(days=today.weekday())
-        return today
+        if kind == 2:
+            return self._season_start()
+        return self._day_start(0)
+
+    async def _fetch_season_ids(self) -> set[str]:
+        """当季放送番剧的 subject id 集合（/calendar，缓存 6 小时）。"""
+        now = time.time()
+        cache = getattr(self, "_season_cache", None)
+        if cache is not None and now - cache[0] < SEASON_CACHE_TTL:
+            return cache[1]
+        data = await self._api_get("/calendar")
+        ids: set[str] = set()
+        if isinstance(data, list):
+            for day in data:
+                if not isinstance(day, dict):
+                    continue
+                for item in day.get("items") or []:
+                    sid = (item or {}).get("id")
+                    if sid:
+                        ids.add(str(sid))
+        if ids:
+            self._season_cache = (now, ids)
+        return ids
 
     def _window_items(self, items: list[dict], kind: int = 0) -> list[dict]:
-        """筛出窗口内的条目（今天 / 本周）。"""
+        """筛出窗口内的条目（今天 / 本周 / 本季度）。"""
         start = self._window_start(kind)
         result = []
         for item in items:
@@ -840,15 +871,12 @@ class BangumiGroupPlugin(Star):
         kind = 0
         if args:
             raw = args[0].strip()
-            if raw == "2":
+            if raw not in {"0", "1", "2"}:
                 yield event.plain_result(
-                    "「本季度新番」排名需要当季番剧清单做交集，"
-                    "当前先支持 0（今天）和 1（本周）。"
-                )
-                return
-            if raw not in {"0", "1"}:
-                yield event.plain_result(
-                    "用法：/番剧排名 [0|1]\n  0 = 今天（默认）\n  1 = 本周"
+                    "用法：/番剧排名 [0|1|2]\n"
+                    "  0 = 今天（默认）\n"
+                    "  1 = 本周\n"
+                    "  2 = 本季度新番（当季放送表口径）"
                 )
                 return
             kind = int(raw)
@@ -861,14 +889,25 @@ class BangumiGroupPlugin(Star):
             )
             return
 
-        window_label = "本周" if kind == 1 else "今天"
+        window_label = {0: "今天", 1: "本周", 2: "本季度新番"}[kind]
         yield event.plain_result(
             f"🔍 正在统计 {len(bindings)} 位群友的追番排行（{window_label}）…"
         )
 
+        season_ids: set[str] | None = None
+        depth = {0: 0, 1: 7}.get(kind, 0)
+        if kind == 2:
+            try:
+                season_ids = await self._fetch_season_ids()
+            except BangumiError:
+                season_ids = set()
+            if not season_ids:
+                yield event.plain_result("❌ 取当季放送表失败，请稍后再试。")
+                return
+            depth = min(130, max(7, (self._now() - self._season_start()).days + 1))
+
         stats: dict[str, dict] = {}
         failed: list[str] = []
-        depth = 7 if kind == 1 else 0
         for index, binding in enumerate(bindings):
             label = binding.get("display") or binding["username"]
             try:
@@ -883,6 +922,8 @@ class BangumiGroupPlugin(Star):
             for item in self._window_items(items, kind):
                 if (item.get("subject_type") or 2) != 2:  # 只统计动画
                     continue
+                if season_ids is not None and str(item.get("subject_id")) not in season_ids:
+                    continue  # 本季度新番：只保留当季放送表中的条目
                 name, _ = self._subject_name(item)
                 key = str(item.get("subject_id") or name)
                 stamp = self._parse_iso(item.get("updated_at"))
@@ -895,7 +936,11 @@ class BangumiGroupPlugin(Star):
                 await asyncio.sleep(self.query_delay)
 
         if not stats:
-            yield event.plain_result(f"📭 {window_label}大家都没有新的追番动态。")
+            yield event.plain_result(
+                f"📭 {window_label}大家都没有新的追番动态。"
+                if kind != 2
+                else "📭 大家本季度还没有追当季新番。"
+            )
             return
 
         ranked = sorted(
