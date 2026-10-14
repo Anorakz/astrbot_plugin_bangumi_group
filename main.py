@@ -40,6 +40,7 @@ import aiohttp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Node, Nodes, Plain
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_bangumi_group"
@@ -67,6 +68,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm查 @群友        看某位群友今天的动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
 /bgm群报            汇总全群今天谁在追番
+/bgm群报订阅 [小时] 每天定时推送群报（默认23:00；取消加「取消」）
 /bgm帮助            显示这条帮助
 
 日期参数：以上查询命令都可加 -N 看更早的动态
@@ -105,6 +107,7 @@ class BangumiGroupPlugin(Star):
         "bgm我", "bgm_me", "我的bgm",
         "bgm查", "bgm_query",
         "bgm群报", "bgm_group", "群报",
+        "bgm群报订阅", "bgm_report_sub", "群报订阅",
         "bgm帮助", "bgm_help",
     }
 
@@ -130,6 +133,7 @@ class BangumiGroupPlugin(Star):
 
         self._cache: dict[str, tuple[float, list[dict]]] = {}
         self._session: aiohttp.ClientSession | None = None
+        self._report_task: asyncio.Task | None = None
         self._init_db()
         logger.info(f"[bangumi_group] 加载完成，API = {self.api_base}")
 
@@ -165,6 +169,16 @@ class BangumiGroupPlugin(Star):
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_bindings_scope ON bindings(scope_id)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_subs (
+                    scope_id   TEXT PRIMARY KEY,
+                    umo        TEXT NOT NULL,
+                    hour       INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
             )
             # 旧库迁移：补 qq_name 列（QQ 群昵称，随该用户使用命令时自动刷新）
             cols = {r[1] for r in conn.execute("PRAGMA table_info(bindings)")}
@@ -482,6 +496,34 @@ class BangumiGroupPlugin(Star):
                 return oid
         return ""
 
+    # ── 群报订阅存储 ────────────────────────────────────────
+
+    def _get_report_sub(self, scope_id: str) -> dict | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM report_subs WHERE scope_id = ?", (scope_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _upsert_report_sub(self, scope_id: str, umo: str, hour: int) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO report_subs(scope_id, umo, hour, created_at) "
+                "VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(scope_id) DO UPDATE SET umo = excluded.umo, hour = excluded.hour",
+                (scope_id, umo, int(hour), self._now().isoformat()),
+            )
+
+    def _delete_report_sub(self, scope_id: str) -> int:
+        with self._conn() as conn:
+            cur = conn.execute("DELETE FROM report_subs WHERE scope_id = ?", (scope_id,))
+        return cur.rowcount
+
+    def _list_report_subs(self) -> list[dict]:
+        with self._conn() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM report_subs")]
+        return rows
+
     # ── 渲染 ────────────────────────────────────────────────
 
     async def _render_user_day(
@@ -635,7 +677,16 @@ class BangumiGroupPlugin(Star):
             f"🔍 正在统计 {len(bindings)} 位群友{day_label}的动态…"
         )
 
-        # 每位绑定群友一个节点，最后合并成转发消息（聊天记录卡片）
+        nodes = await self._build_report_nodes(scope, day_offset)
+        yield event.chain_result([Nodes(nodes)])
+
+    async def _build_report_nodes(self, scope: str, day_offset: int = 0) -> list[Node]:
+        """构建群报节点：每位绑定群友一条，最后合并为转发消息。"""
+        day_label = self._day_label(day_offset)
+        bindings = self._list_bindings(scope)
+        if not bindings:
+            return []
+
         nodes: list[Node] = []
         now = self._now()
         nodes.append(
@@ -692,12 +743,84 @@ class BangumiGroupPlugin(Star):
             if self.query_delay and index != len(bindings) - 1:
                 await asyncio.sleep(self.query_delay)
 
-        yield event.chain_result([Nodes(nodes)])
+        return nodes
+
+    # ── 群报订阅（每日定时推送）──────────────────────────────
+
+    @filter.command("bgm群报订阅", alias={"bgm_report_sub", "群报订阅"})
+    async def report_subscribe(self, event: AstrMessageEvent):
+        scope = self._scope_id(event)
+        args = self._args(event)
+        if args and args[0].strip().lower() in {"off", "cancel", "取消", "关", "关闭"}:
+            if self._delete_report_sub(scope):
+                yield event.plain_result("✅ 已取消本群的群报订阅。")
+            else:
+                yield event.plain_result("本群还没有订阅群报。")
+            return
+
+        hour = 23
+        if args:
+            raw = args[0].strip().rstrip("点:：时")
+            if not raw.isdigit() or not (0 <= int(raw) <= 23):
+                yield event.plain_result(
+                    "用法：/bgm群报订阅 [小时]\n"
+                    "  小时为 0-23 的整数，默认 23（每天 23:00 推送）\n"
+                    "  取消：/bgm群报订阅 取消"
+                )
+                return
+            hour = int(raw)
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            yield event.plain_result("❌ 无法确定会话标识，订阅失败。")
+            return
+        self._upsert_report_sub(scope, umo, hour)
+        yield event.plain_result(
+            f"✅ 已订阅每日群报\n"
+            f"   推送时间：每天 {hour:02d}:00\n"
+            f"   取消方式：/bgm群报订阅 取消"
+        )
+
+    async def initialize(self) -> None:
+        if self._report_task is None or self._report_task.done():
+            self._report_task = asyncio.create_task(self._report_loop())
+            logger.info("[bangumi_group] 群报订阅调度已启动")
+
+    async def _report_loop(self) -> None:
+        """睡到每个整点，检查是否有订阅需要推送。"""
+        try:
+            while True:
+                now = self._now()
+                nxt = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+                await asyncio.sleep(max(5.0, (nxt - now).total_seconds()))
+                await self._report_tick()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # 兜底，避免任务静默死亡
+            logger.error(f"[bangumi_group] 群报订阅循环异常退出: {exc}")
+
+    async def _report_tick(self) -> None:
+        hour = self._now().hour
+        for sub in self._list_report_subs():
+            if int(sub.get("hour") or -1) != hour:
+                continue
+            try:
+                nodes = await self._build_report_nodes(sub["scope_id"], 0)
+                if not nodes:
+                    continue
+                await self.context.send_message(
+                    sub["umo"], MessageChain([Nodes(nodes)])
+                )
+                logger.info(f"[bangumi_group] 群报已推送 → {sub['umo']}")
+            except Exception as exc:
+                logger.error(f"[bangumi_group] 群报推送失败 {sub.get('umo')}: {exc}")
 
     @filter.command("bgm帮助", alias={"bgm_help"})
     async def help_cmd(self, event: AstrMessageEvent):
         yield event.plain_result(HELP_TEXT)
 
     async def terminate(self):
+        if self._report_task and not self._report_task.done():
+            self._report_task.cancel()
         if self._session and not self._session.closed:
             await self._session.close()
