@@ -69,6 +69,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
 /bgm群报            汇总全群今天谁在追番
 /bgm群报订阅 [小时] 每天定时推送群报（默认23:00；取消加「取消」）
+/番剧排名 [0|1]     群友追番排行前三（0=今天 默认；1=本周）
 /bgm帮助            显示这条帮助
 
 日期参数：以上查询命令都可加 -N 看更早的动态
@@ -108,6 +109,7 @@ class BangumiGroupPlugin(Star):
         "bgm查", "bgm_query",
         "bgm群报", "bgm_group", "群报",
         "bgm群报订阅", "bgm_report_sub", "群报订阅",
+        "番剧排名", "bgm_rank", "追番排名",
         "bgm帮助", "bgm_help",
     }
 
@@ -287,6 +289,23 @@ class BangumiGroupPlugin(Star):
         for item in items:
             stamp = self._parse_iso(item.get("updated_at"))
             if stamp is not None and stamp.astimezone(self.tz).date() == target:
+                result.append(item)
+        return result
+
+    def _window_start(self, kind: int) -> dt.datetime:
+        """统计窗口起点：0=今天 00:00；1=本周一 00:00。"""
+        today = self._day_start(0)
+        if int(kind) == 1:
+            return today - dt.timedelta(days=today.weekday())
+        return today
+
+    def _window_items(self, items: list[dict], kind: int = 0) -> list[dict]:
+        """筛出窗口内的条目（今天 / 本周）。"""
+        start = self._window_start(kind)
+        result = []
+        for item in items:
+            stamp = self._parse_iso(item.get("updated_at"))
+            if stamp is not None and stamp.astimezone(self.tz) >= start:
                 result.append(item)
         return result
 
@@ -814,6 +833,92 @@ class BangumiGroupPlugin(Star):
                 logger.info(f"[bangumi_group] 群报已推送 → {sub['umo']}")
             except Exception as exc:
                 logger.error(f"[bangumi_group] 群报推送失败 {sub.get('umo')}: {exc}")
+
+    @filter.command("番剧排名", alias={"bgm_rank", "追番排名"})
+    async def rank(self, event: AstrMessageEvent):
+        args = self._args(event)
+        kind = 0
+        if args:
+            raw = args[0].strip()
+            if raw == "2":
+                yield event.plain_result(
+                    "「本季度新番」排名需要当季番剧清单做交集，"
+                    "当前先支持 0（今天）和 1（本周）。"
+                )
+                return
+            if raw not in {"0", "1"}:
+                yield event.plain_result(
+                    "用法：/番剧排名 [0|1]\n  0 = 今天（默认）\n  1 = 本周"
+                )
+                return
+            kind = int(raw)
+
+        scope = self._scope_id(event)
+        bindings = self._list_bindings(scope)
+        if not bindings:
+            yield event.plain_result(
+                "本群还没有人绑定 Bangumi 账号。\n让群友发 /bgm绑定 <用户名> 即可。"
+            )
+            return
+
+        window_label = "本周" if kind == 1 else "今天"
+        yield event.plain_result(
+            f"🔍 正在统计 {len(bindings)} 位群友的追番排行（{window_label}）…"
+        )
+
+        stats: dict[str, dict] = {}
+        failed: list[str] = []
+        depth = 7 if kind == 1 else 0
+        for index, binding in enumerate(bindings):
+            label = binding.get("display") or binding["username"]
+            try:
+                items = await self._fetch_collections(binding["username"], depth)
+            except UserNotFound:
+                failed.append(label)
+                continue
+            except BangumiError:
+                failed.append(label)
+                continue
+
+            for item in self._window_items(items, kind):
+                if (item.get("subject_type") or 2) != 2:  # 只统计动画
+                    continue
+                name, _ = self._subject_name(item)
+                key = str(item.get("subject_id") or name)
+                stamp = self._parse_iso(item.get("updated_at"))
+                row = stats.setdefault(key, {"name": name, "members": set(), "latest": None})
+                row["members"].add(label)
+                if stamp is not None and (row["latest"] is None or stamp > row["latest"]):
+                    row["latest"] = stamp
+
+            if self.query_delay and index != len(bindings) - 1:
+                await asyncio.sleep(self.query_delay)
+
+        if not stats:
+            yield event.plain_result(f"📭 {window_label}大家都没有新的追番动态。")
+            return
+
+        ranked = sorted(
+            stats.values(),
+            key=lambda r: (
+                -len(r["members"]),
+                -(r["latest"].timestamp() if r["latest"] else 0.0),
+                r["name"],
+            ),
+        )
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [f"🏆 群友追番排行 · {window_label}（{len(bindings)} 人参与）", ""]
+        for i, row in enumerate(ranked[:3]):
+            who = "、".join(sorted(row["members"]))
+            lines.append(f"{medals[i]} 《{row['name']}》 · {len(row['members'])} 人")
+            lines.append(f"      {who}")
+        if len(ranked) > 3:
+            lines.append("")
+            lines.append(f"（另有 {len(ranked) - 3} 部各有动态，未进前三）")
+        if failed:
+            lines.append(f"（查询失败：{'、'.join(failed)}）")
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("bgm帮助", alias={"bgm_help"})
     async def help_cmd(self, event: AstrMessageEvent):
