@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -395,11 +396,31 @@ class BangumiGroupPlugin(Star):
 
     @staticmethod
     def _extract_target_id(event: AstrMessageEvent) -> str:
+        """取 @ 的目标用户 ID。
+
+        aiocqhttp(NapCat) 平台：目标群友的 At 组件直接带 QQ 号。
+        qq_official 官方平台：每条群消息都固定带一个「@机器人」的 At 组件
+        （qq = 事件 self_id），必须跳过，否则会误把机器人当查询目标；
+        且 @ 其他群友不会生成 At 组件，而是以 `<@!openid>` 文本形式
+        残留在 message_str 里，需要自行解析（openid 恰好是绑定表的 user_id）。
+        """
+        self_id = str(getattr(event, "self_id", "") or "")
         for component in event.get_messages():
             if isinstance(component, At):
                 qq = getattr(component, "qq", None)
-                if qq is not None and str(qq) not in {"all", "0", "-1"}:
-                    return str(qq)
+                if qq is None:
+                    continue
+                qq = str(qq)
+                if qq in {"all", "0", "-1"}:
+                    continue
+                if self_id and qq == self_id:
+                    continue  # 官方平台：每条群消息自带的「@机器人」组件
+                return qq
+        m = re.search(r"<@!?(\w+)", getattr(event, "message_str", "") or "")
+        if m:
+            oid = m.group(1)
+            if not (self_id and oid == self_id):
+                return oid
         return ""
 
     # ── 渲染 ────────────────────────────────────────────────
