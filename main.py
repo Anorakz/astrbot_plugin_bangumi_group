@@ -965,6 +965,38 @@ class BangumiGroupPlugin(Star):
             lines.append(f"（查询失败：{'、'.join(failed)}）")
         yield event.plain_result("\n".join(lines))
 
+    @filter.regex(r"^/?bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助)\S+$")
+    async def nospace_dispatch(self, event: AstrMessageEvent):
+        """兼容漏打空格的写法（如 /bgm绑定xxx、/bgm查mzfl）。
+
+        AstrBot 的标准指令匹配要求「指令名 + 空格」或整串相等
+        （core/star/filter/command.py: startswith(cmd + " ")），
+        漏空格时命令不会被调用。这里用正则兜住，补空格后转交对应指令。
+        """
+        text = (event.message_str or "").strip()
+        m = re.match(
+            r"^/?(bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助))(\S+)$", text
+        )
+        if not m:
+            return
+        cmd_word, rest = m.group(1), m.group(2)
+        handler = {
+            "bgm绑定": self.bind,
+            "bgm解绑": self.unbind,
+            "bgm我": self.me,
+            "bgm查": self.query,
+            "bgm群报": self.group_report,
+            "bgm群报订阅": self.report_subscribe,
+            "bgm排名": self.rank,
+            "bgm帮助": self.help_cmd,
+        }.get(cmd_word)
+        if handler is None:
+            return
+        logger.info(f"[bangumi_group] 漏空格兼容：{text!r} → /{cmd_word} {rest}")
+        event.message_str = f"/{cmd_word} {rest}"
+        async for piece in handler(event):
+            yield piece
+
     @filter.command("bgm帮助", alias={"bgm_help"})
     async def help_cmd(self, event: AstrMessageEvent):
         yield event.plain_result(HELP_TEXT)
