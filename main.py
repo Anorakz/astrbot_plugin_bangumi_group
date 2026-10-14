@@ -39,7 +39,7 @@ import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
 PLUGIN_NAME = "astrbot_plugin_bangumi_group"
@@ -635,51 +635,64 @@ class BangumiGroupPlugin(Star):
             f"🔍 正在统计 {len(bindings)} 位群友{day_label}的动态…"
         )
 
-        active: list[str] = []
-        quiet: list[str] = []
-        errors: list[str] = []
+        # 每位绑定群友一个节点，最后合并成转发消息（聊天记录卡片）
+        nodes: list[Node] = []
+        now = self._now()
+        nodes.append(
+            Node(
+                content=[
+                    Plain(
+                        f"📊 Bangumi 群报 · {now:%m-%d} · {day_label}\n"
+                        f"本群已绑定 {len(bindings)} 人，每人一条"
+                    )
+                ],
+                name="群报",
+                uin="0",
+            )
+        )
 
         for index, binding in enumerate(bindings):
             label = binding.get("display") or binding["username"]
+            uin = str(binding.get("user_id") or "0")
             try:
                 items = await self._fetch_collections(binding["username"], day_offset)
             except UserNotFound:
-                errors.append(f"{label}（用户不存在）")
+                nodes.append(
+                    Node(
+                        content=[Plain(f"⚠️ {label} · 用户不存在（可能已改名或注销）")],
+                        name=label,
+                        uin=uin,
+                    )
+                )
                 continue
             except BangumiError as exc:
-                errors.append(f"{label}（{exc}）")
+                nodes.append(
+                    Node(
+                        content=[Plain(f"⚠️ {label} · 查询失败：{exc}")],
+                        name=label,
+                        uin=uin,
+                    )
+                )
                 continue
 
             day_items = self._day_items(items, day_offset)
             if not day_items:
-                quiet.append(label)
+                text = f"📭 {label} · {day_label}没有新动态"
             else:
-                block = [f"▸ {label} · {len(day_items)} 条"]
+                lines = [f"📖 {label} · {day_label}有 {len(day_items)} 条动态"]
                 for item in day_items[:MAX_ITEMS_PER_USER_IN_REPORT]:
-                    block.append("    " + self._format_item(item))
+                    lines.append(self._format_item(item))
                 if len(day_items) > MAX_ITEMS_PER_USER_IN_REPORT:
-                    block.append(
-                        f"    …… 还有 {len(day_items) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
+                    lines.append(
+                        f"…… 还有 {len(day_items) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
                     )
-                active.append("\n".join(block))
+                text = "\n".join(lines)
+            nodes.append(Node(content=[Plain(text)], name=label, uin=uin))
 
             if self.query_delay and index != len(bindings) - 1:
                 await asyncio.sleep(self.query_delay)
 
-        now = self._now()
-        lines = [f"📊 Bangumi 群报 · {now:%m-%d} · {day_label}", f"本群已绑定 {len(bindings)} 人", ""]
-        if active:
-            lines.append(f"{day_label}有动态：{len(active)} 人")
-            lines.extend(active)
-        else:
-            lines.append(f"{day_label}大家都还没有动静。")
-        if quiet:
-            lines.append("")
-            lines.append(f"{day_label}无动态：{'、'.join(quiet)}")
-        if errors:
-            lines.append("")
-            lines.append(f"查询失败：{'、'.join(errors)}")
-        yield event.plain_result("\n".join(lines))
+        yield event.chain_result([Nodes(nodes)])
 
     @filter.command("bgm帮助", alias={"bgm_help"})
     async def help_cmd(self, event: AstrMessageEvent):
