@@ -603,6 +603,29 @@ class BangumiGroupPlugin(Star):
     # ── 命令 ────────────────────────────────────────────────
 
     @filter.command("bgm绑定", alias={"bgm_bind", "绑定bgm"})
+    async def _resolve_query_key(self, profile: dict, keyword: str) -> str:
+        """选出对该用户真正可用的查询键。
+
+        Bangumi 的查询键因账号而异：自定义过用户名的用字符串，没自定义的
+        用数字 uid；两者互不通用（用错那个会 404）。这里按
+        username → id → 原始输入 的顺序探测，返回第一个能查到收藏的键，
+        保证后续 /bgm我、群报、排名都查得到。
+        """
+        candidates: list[str] = []
+        for value in (profile.get("username"), profile.get("id"), keyword):
+            text = str(value or "").strip()
+            if text and text not in candidates:
+                candidates.append(text)
+        for key in candidates:
+            try:
+                await self._api_get(
+                    f"/v0/users/{quote(key)}/collections", {"limit": 1}
+                )
+                return key
+            except BangumiError:
+                continue
+        return candidates[0] if candidates else keyword
+
     async def bind(self, event: AstrMessageEvent):
         args = self._args(event)
         if not args:
@@ -625,7 +648,7 @@ class BangumiGroupPlugin(Star):
             yield event.plain_result(f"❌ 查询失败：{exc}")
             return
 
-        username = str(profile.get("username") or keyword)
+        username = await self._resolve_query_key(profile, keyword)
         display = str(profile.get("nickname") or username)
         try:
             qq_name = str(event.get_sender_name() or "").strip()
