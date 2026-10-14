@@ -64,7 +64,8 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm绑定 <用户名>   绑定你的 Bangumi 账号
 /bgm解绑            解除绑定
 /bgm我              看看我今天在追什么
-/bgm查 <名字>        按群昵称/昵称/用户名查绑定群友（如 /bgm查 day）
+/bgm查 @群友        看某位群友今天的动态
+/bgm查 <用户名>     直接查任意账号（无需绑定）
 /bgm群报            汇总全群今天谁在追番
 /bgm帮助            显示这条帮助
 
@@ -596,25 +597,14 @@ class BangumiGroupPlugin(Star):
         if not target:
             if not args:
                 yield event.plain_result(
-                    "用法：/bgm查 <群昵称 | 昵称 | 用户名> [-N]\n"
+                    "用法：/bgm查 @群友 [-N]   或   /bgm查 <Bangumi 用户名> [-N]\n"
                     "N 可选：-0 今天（默认）、-1 昨天、-2 前天……依次递推"
                 )
                 return
             keyword = args[0].strip().lstrip("@")
-            # 按 群昵称→昵称→用户名 命中（官方平台 @群友 拿不到 openid 的替代方案）
-            by_keyword = self._find_binding_by_keyword(scope, keyword)
-            if by_keyword:
-                self._refresh_qq_name(event, by_keyword)
-                label = by_keyword.get("display") or by_keyword["username"]
-                yield event.plain_result(
-                    await self._render_user_day(
-                        by_keyword["username"], f"{label} ", day_offset
-                    )
-                )
-                return
+            # 无 @ 时直接按 Bangumi 用户名/UID 搜索（不要求绑定）
             yield event.plain_result(
-                f"「{keyword}」还没有绑定 Bangumi 账号。\n"
-                "让 TA 私聊机器人发 /bgm绑定 <Bangumi用户名> 即可。"
+                await self._render_user_day(keyword, f"{keyword} ", day_offset)
             )
             return
 
