@@ -68,7 +68,7 @@ HELP_TEXT = """Bangumi 群友动态
 /bgm我              看看我今天在追什么
 /bgm查 @群友        看某位群友今天的动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
-/bgm群报            汇总全群今天谁在追番
+/bgm群报            汇总全群近24小时谁在追番（加 -N 按自然日查）
 /bgm群报订阅 [小时] 每天定时推送群报（默认23:00；取消加「取消」）
 /番剧排名 [0|1|2]    群友追番排行前三（0今天 1本周 2本季新番）
 /bgm帮助            显示这条帮助
@@ -339,6 +339,29 @@ class BangumiGroupPlugin(Star):
             if stamp is not None and stamp.astimezone(self.tz) >= start:
                 result.append(item)
         return result
+
+    def _recent_items(self, items: list[dict], hours: int = 24) -> list[dict]:
+        """筛出最近 hours 小时内的条目（滚动窗口，用于群报）。
+
+        窗口 = (现在 - hours, 现在]，对应「上次推送时刻 → 本次推送时刻」，
+        因此定时群报（每天同一时刻推）拿到的正好是两推之间 24 小时的更新。
+        """
+        end = self._now()
+        start = end - dt.timedelta(hours=max(1, int(hours)))
+        result = []
+        for item in items:
+            stamp = self._parse_iso(item.get("updated_at"))
+            if stamp is None:
+                continue
+            local = stamp.astimezone(self.tz)
+            if start < local <= end:
+                result.append(item)
+        return result
+
+    def _recent_label(self, hours: int = 24) -> str:
+        end = self._now()
+        start = end - dt.timedelta(hours=max(1, int(hours)))
+        return f"近 {hours} 小时（{start:%m-%d %H:%M} → {end:%m-%d %H:%M}）"
 
     def _day_label(self, day_offset: int) -> str:
         """人类可读的日期标签：今天 / 昨天 / 前天 / MM-DD。"""
@@ -736,8 +759,9 @@ class BangumiGroupPlugin(Star):
     @filter.command("bgm群报", alias={"bgm_group", "群报"})
     async def group_report(self, event: AstrMessageEvent):
         scope = self._scope_id(event)
-        day_offset, _ = self._parse_day_offset(self._args(event))
-        day_label = self._day_label(day_offset)
+        raw_args = self._args(event)
+        day_offset, _ = self._parse_day_offset(raw_args)
+        legacy = bool(raw_args)  # 显式带参数 → 按自然日（兼容 /bgm群报 -N 历史查询）
 
         bindings = self._list_bindings(scope)
         if not bindings:
@@ -746,16 +770,31 @@ class BangumiGroupPlugin(Star):
             )
             return
 
+        window_text = self._day_label(day_offset) if legacy else "近 24 小时"
         yield event.plain_result(
-            f"🔍 正在统计 {len(bindings)} 位群友{day_label}的动态…"
+            f"🔍 正在统计 {len(bindings)} 位群友{window_text}的动态…"
         )
 
-        nodes = await self._build_report_nodes(scope, day_offset)
+        nodes = (
+            await self._build_report_nodes(scope, day_offset=day_offset)
+            if legacy
+            else await self._build_report_nodes(scope)
+        )
         yield event.chain_result([Nodes(nodes)])
 
-    async def _build_report_nodes(self, scope: str, day_offset: int = 0) -> list[Node]:
-        """构建群报节点：每位绑定群友一条，最后合并为转发消息。"""
-        day_label = self._day_label(day_offset)
+    async def _build_report_nodes(
+        self, scope: str, day_offset: int | None = None, hours: int = 24
+    ) -> list[Node]:
+        """构建群报节点：每位绑定群友一条，最后合并为转发消息。
+
+        day_offset=None（默认）→ 滚动窗口「近 hours 小时」，
+          对应「上次推送时刻 → 本次推送时刻」的更新；
+        传 day_offset → 按自然日统计（兼容 /bgm群报 -N）。
+        """
+        rolling = day_offset is None
+        short_label = f"近 {hours} 小时" if rolling else self._day_label(int(day_offset))
+        full_label = self._recent_label(hours) if rolling else self._day_label(int(day_offset))
+        depth = 1 if rolling else int(day_offset)
         bindings = self._list_bindings(scope)
         if not bindings:
             return []
@@ -766,7 +805,7 @@ class BangumiGroupPlugin(Star):
             Node(
                 content=[
                     Plain(
-                        f"📊 Bangumi 群报 · {now:%m-%d} · {day_label}\n"
+                        f"📊 Bangumi 群报 · {now:%m-%d} · {full_label}\n"
                         f"本群已绑定 {len(bindings)} 人，每人一条"
                     )
                 ],
@@ -779,7 +818,7 @@ class BangumiGroupPlugin(Star):
             label = binding.get("display") or binding["username"]
             uin = str(binding.get("user_id") or "0")
             try:
-                items = await self._fetch_collections(binding["username"], day_offset)
+                items = await self._fetch_collections(binding["username"], depth)
             except UserNotFound:
                 nodes.append(
                     Node(
@@ -799,11 +838,15 @@ class BangumiGroupPlugin(Star):
                 )
                 continue
 
-            day_items = self._day_items(items, day_offset)
+            day_items = (
+                self._recent_items(items, hours)
+                if rolling
+                else self._day_items(items, int(day_offset))
+            )
             if not day_items:
-                text = f"📭 {label} · {day_label}没有新动态"
+                text = f"📭 {label} · {short_label}没有新动态"
             else:
-                lines = [f"📖 {label} · {day_label}有 {len(day_items)} 条动态"]
+                lines = [f"📖 {label} · {short_label}有 {len(day_items)} 条动态"]
                 for item in day_items[:MAX_ITEMS_PER_USER_IN_REPORT]:
                     lines.append(self._format_item(item))
                 if len(day_items) > MAX_ITEMS_PER_USER_IN_REPORT:
@@ -878,7 +921,7 @@ class BangumiGroupPlugin(Star):
             if int(sub.get("hour") or -1) != hour:
                 continue
             try:
-                nodes = await self._build_report_nodes(sub["scope_id"], 0)
+                nodes = await self._build_report_nodes(sub["scope_id"])  # 滚动近 24 小时
                 if not nodes:
                     continue
                 await self.context.send_message(
