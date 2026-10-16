@@ -84,7 +84,7 @@ HELP_TEXT = """Bangumi 群友动态
     · 之后再次改动它（改评分/推进度），就会从原来那天消失
   想要逐集时间线，只能去 Bangumi 网页自己看。
 
-用户名就是 bgm.tv/user/<这一段>，例如 /bgm绑定 sai
+用户名就是个人主页地址里的最后一段，例如 /bgm绑定 sai
 只能读取公开收藏，若提示查不到请到 Bangumi 设置里把收藏改为公开。"""
 
 
@@ -654,7 +654,7 @@ class BangumiGroupPlugin(Star):
         if not args:
             yield event.plain_result(
                 "用法：/bgm绑定 <Bangumi 用户名或 UID>\n"
-                "用户名就是 bgm.tv/user/<这一段>，例如 /bgm绑定 sai"
+                "用户名就是个人主页地址里的最后一段，例如 /bgm绑定 sai"
             )
             return
 
@@ -686,7 +686,7 @@ class BangumiGroupPlugin(Star):
         )
         yield event.plain_result(
             f"✅ 绑定成功\n"
-            f"   你的 Bangumi：{display}（bgm.tv/user/{username}）\n"
+            f"   你的 Bangumi：{display}（用户名 {username}）\n"
             f"   之后发 /bgm我 就能看今天的追番动态。"
         )
 
