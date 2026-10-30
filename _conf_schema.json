@@ -12,9 +12,9 @@
     "default": ""
   },
   "timezone": {
-    "description": "判定「今天」使用的时区",
+    "description": "时间显示与自然日窗口使用的时区",
     "type": "string",
-    "hint": "IANA 时区名，默认 Asia/Shanghai",
+    "hint": "IANA 时区名，默认 Asia/Shanghai。影响动态时间的显示，以及 /番剧排名 的「今天/本周/本季」窗口",
     "default": "Asia/Shanghai"
   },
   "cache_ttl": {
@@ -26,7 +26,7 @@
   "max_pages": {
     "description": "每人最多翻几页收藏",
     "type": "int",
-    "hint": "接口按更新时间倒序返回，每页 30 条。默认 2 页（60 条）足够覆盖当天动态；调大可覆盖更活跃的用户，但会更慢",
+    "hint": "接口按更新时间倒序返回，每页 30 条。默认 2 页（60 条）足够覆盖近 24 小时动态；时间窗每宽 24 小时自动多给 1 页（硬上限 10 页）",
     "default": 2
   },
   "query_delay": {
