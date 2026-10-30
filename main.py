@@ -1,9 +1,9 @@
 """Bangumi 群友动态
 
 让群友把自己的 Bangumi 账号绑定到机器人，然后：
-  * /bgm我      查看自己今天的追番动态
-  * /bgm查      查看某位群友今天的追番动态
-  * /bgm群报    汇总全群今天谁在追番
+  * /bgm我      查看自己近 24 小时的追番动态
+  * /bgm查      查看某位群友近 24 小时的追番动态
+  * /bgm群报    汇总全群近 24 小时谁在追番
 
 数据来源为 Bangumi 公开 API（默认 https://api.bgm.tv）。
 如果所在网络无法直连，在插件配置里把 api_base 指向可用的反向代理地址即可。
@@ -13,14 +13,15 @@
   Bangumi 公开接口**不提供单集观看记录**（/v0/users/{u}/collections 只有
   一个笼统的 updated_at 和当前的 ep_status，没有「第 N 集是哪天看的」）。
   因此：
-    · 一条番剧只会出现在它最后一次被改动的那一天
-    · 之后再次改动它，就会从原来那天「消失」（时间被覆盖）
+    · 一条番剧只会出现在它「最后一次被改动」的那个时间点
+    · 之后再次改动它，就会从原来那个时间窗里消失（时间被覆盖）
   这是接口能力边界，不是 bug。要逐集时间线只能看 Bangumi 网页。
 
-  接口按 updated_at 倒序返回，因此查某一天只需拉前几页即可覆盖。
+  接口按 updated_at 倒序返回，因此只需拉前几页即可覆盖所需时间窗。
 
-日期参数：所有查询命令都支持在末尾加 `-N` 指定「往前第 N 天」，
-  -0（默认）今天、-1 昨天、-2 前天……依次递推。
+时间窗参数：所有查询命令都支持在末尾加 `-N` 扩大时间窗，
+  默认（不加参数）= 近 24 小时，-1 = 近 48 小时，-2 = 近 72 小时……
+  即 `-N` 表示「近 24 × (N+1) 小时」，是滚动时间窗，不再按自然日切分。
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ SUBJECT_LABEL = {1: "书籍", 2: "动画", 3: "音乐", 4: "游戏", 5: "三次�
 PAGE_SIZE = 30
 MAX_ITEMS_PER_USER = 20
 MAX_ITEMS_PER_USER_IN_REPORT = 6
-# 拉取分页的上限。查历史日期时可能需要多拉几页，
+# 拉取分页的上限。时间窗越宽需要翻越多的页，
 # 但仍要留一个硬上限，避免单个用户把整份收藏都翻完。
 MAX_PAGES_HARD = 10
 SEASON_CACHE_TTL = 6 * 3600  # 当季放送表缓存（秒）
@@ -65,23 +66,24 @@ HELP_TEXT = """Bangumi 群友动态
 
 /bgm绑定 <用户名>   绑定你的 Bangumi 账号
 /bgm解绑            解除绑定
-/bgm我              看看我今天在追什么
-/bgm查 @群友        看某位群友今天的动态
+/bgm我              看看我近 24 小时在追什么
+/bgm查 @群友        看某位群友近 24 小时的动态
 /bgm查 <用户名>     直接查任意账号（无需绑定）
-/bgm群报            汇总全群近24小时谁在追番（加 -N 按自然日查）
+/bgm群报            汇总全群近 24 小时谁在追番
 /bgm群报订阅 [小时] 每天定时推送群报（默认23:00；取消加「取消」）
 /番剧排名 [0|1|2]    群友追番排行前三（0今天 1本周 2本季新番）
 /bgm帮助            显示这条帮助
 
-日期参数：以上查询命令都可加 -N 看更早的动态
-  -0 今天（默认）、-1 昨天、-2 前天……依次递推
-  例如：/bgm我 -1        /bgm查 @群友 -3      /bgm群报 -7
+时间窗参数：以上查询命令都可加 -N 扩大时间窗
+  默认（不加）= 近 24 小时，-1 = 近 48 小时，-2 = 近 72 小时……
+  每 +1 多 24 小时，即 -N 表示「近 24×(N+1) 小时」
+  例如：/bgm我 -1        /bgm查 @群友 -3（近 96 小时）      /bgm群报 -2
 
 ⚠️ 口径说明（重要）
   本插件读的是「收藏条目的最后修改时间」，不是「第几集是哪天看的」。
   Bangumi 公开接口不提供单集观看记录，所以：
-    · 一条番剧只会出现在它「最后一次被改动」的那一天
-    · 之后再次改动它（改评分/推进度），就会从原来那天消失
+    · 一条番剧只会出现在它「最后一次被改动」的那个时间点
+    · 之后再次改动它（改评分/推进度），就会从原来那个时间窗消失
   想要逐集时间线，只能去 Bangumi 网页自己看。
 
 用户名就是个人主页地址里的最后一段，例如 /bgm绑定 sai
@@ -99,8 +101,8 @@ class UserNotFound(BangumiError):
 @register(
     PLUGIN_NAME,
     "Anorakz",
-    "绑定群友 Bangumi 账号，查询追番动态与全群汇总（支持 -N 指定天数）",
-    "v1.1.0",
+    "绑定群友 Bangumi 账号，查询追番动态与全群汇总（-N 扩大时间窗，默认近 24 小时）",
+    "v1.2.0",
 )
 class BangumiGroupPlugin(Star):
     _CMD_WORDS = {
@@ -235,28 +237,32 @@ class BangumiGroupPlugin(Star):
             raise UserNotFound(username)
         return data
 
-    async def _fetch_collections(self, username: str, day_offset: int = 0) -> list[dict]:
+    async def _fetch_collections(self, username: str, hours: int = 24) -> list[dict]:
         """拉取收藏列表（接口按 updated_at 倒序，故只需前面几页）。
 
-        day_offset 表示需要覆盖到「往前第几天」：0 拉到今天为止，
-        1 表示需要覆盖到昨天，以此类推（内部统一存正数深度）。
-        缓存记录 (拉取时刻, 条目, 已覆盖深度)，只要缓存还新鲜
-        且上次覆盖的深度 >= 本次所需深度，就直接复用。
+        hours 是需要的滚动时间窗（近 hours 小时）：只要已拉到的最后一条
+        早于「现在 - hours」，说明该窗口已被完整覆盖，可以停止翻页。
+        缓存记录 (拉取时刻, 条目, 已覆盖到的最早时间点)，只要缓存还新鲜
+        且覆盖范围已包含本次所需窗口，就直接复用。
         """
         now = time.time()
-        need = max(0, int(day_offset))
-        wanted_start = self._day_start(need)
+        hours = max(1, int(hours))
+        wanted_start = self._now() - dt.timedelta(hours=hours)
 
         cached = self._cache.get(username)
         if cached:
-            stamp, cached_items, covered_depth = cached
+            stamp, cached_items, covered_from = cached
             fresh = now - stamp < self.cache_ttl
-            if fresh and covered_depth >= need:
+            if fresh and covered_from <= wanted_start:
                 return cached_items
 
         items: list[dict] = []
-        covered_depth = need
-        pages_budget = max(self.max_pages, min(MAX_PAGES_HARD, self.max_pages + need))
+        covered_from = self._now()
+        # 时间窗每宽 24 小时多给一页预算（默认 24 小时即不加）
+        extra_pages = max(0, (hours - 1) // 24)
+        pages_budget = max(
+            self.max_pages, min(MAX_PAGES_HARD, self.max_pages + extra_pages)
+        )
         for page in range(pages_budget):
             data = await self._api_get(
                 f"/v0/users/{quote(username)}/collections",
@@ -266,33 +272,30 @@ class BangumiGroupPlugin(Star):
             items.extend(batch)
             if len(batch) < PAGE_SIZE:
                 # 拉完了全部收藏，覆盖范围足够深
-                covered_depth = MAX_PAGES_HARD * 10
+                covered_from = dt.datetime(1970, 1, 1, tzinfo=self.tz)
                 break
             tail = self._parse_iso(batch[-1].get("updated_at"))
-            if tail is not None and tail.astimezone(self.tz) < wanted_start:
-                # 尾条已经早于目标日期，说明所需区间已完整覆盖
+            if tail is None:
+                continue
+            tail_local = tail.astimezone(self.tz)
+            # 尾条即目前能看到的最早时间点
+            covered_from = tail_local
+            if tail_local < wanted_start:
+                # 尾条已经早于目标窗口起点，说明所需区间已完整覆盖
                 break
-        else:
-            # 页数用尽仍未触及目标日期，如实记录覆盖不到那么深
-            covered_depth = need - 1 if need > 0 else 0
+        # 页数用尽仍未触及窗口起点时，covered_from 停在尾条时间，
+        # 下次同样深度的查询会判定「没覆盖到」从而重新拉取。
 
-        self._cache[username] = (now, items, covered_depth)
+        self._cache[username] = (now, items, covered_from)
         return items
 
     def _day_start(self, day_offset: int) -> dt.datetime:
-        """返回「往前第 day_offset 天」当天 00:00（带时区）。"""
+        """返回「往前第 day_offset 天」当天 00:00（带时区）。
+
+        仅用于 /番剧排名 的自然日窗口（今天 / 本周 / 本季）。
+        """
         base = self._now().replace(hour=0, minute=0, second=0, microsecond=0)
         return base - dt.timedelta(days=max(0, int(day_offset)))
-
-    def _day_items(self, items: list[dict], day_offset: int = 0) -> list[dict]:
-        """筛出目标日期当天的条目。"""
-        target = self._day_start(day_offset).date()
-        result = []
-        for item in items:
-            stamp = self._parse_iso(item.get("updated_at"))
-            if stamp is not None and stamp.astimezone(self.tz).date() == target:
-                result.append(item)
-        return result
 
     def _season_start(self) -> dt.datetime:
         """当前季度起始日 00:00（1/4/7/10 月 1 号）。"""
@@ -341,10 +344,11 @@ class BangumiGroupPlugin(Star):
         return result
 
     def _recent_items(self, items: list[dict], hours: int = 24) -> list[dict]:
-        """筛出最近 hours 小时内的条目（滚动窗口，用于群报）。
+        """筛出最近 hours 小时内的条目（滚动时间窗）。
 
-        窗口 = (现在 - hours, 现在]，对应「上次推送时刻 → 本次推送时刻」，
-        因此定时群报（每天同一时刻推）拿到的正好是两推之间 24 小时的更新。
+        窗口 = (现在 - hours, 现在]，不按自然日切分：
+          · 手动查询 → 就是「从此刻往前数 hours 小时」
+          · 定时群报（每天同一时刻推）→ 恰好是上次推送到现在这一段
         """
         end = self._now()
         start = end - dt.timedelta(hours=max(1, int(hours)))
@@ -363,14 +367,19 @@ class BangumiGroupPlugin(Star):
         start = end - dt.timedelta(hours=max(1, int(hours)))
         return f"近 {hours} 小时（{start:%m-%d %H:%M} → {end:%m-%d %H:%M}）"
 
-    def _day_label(self, day_offset: int) -> str:
-        """人类可读的日期标签：今天 / 昨天 / 前天 / MM-DD。"""
-        day = self._day_start(day_offset).date()
-        mapping = {0: "今天", 1: "昨天", 2: "前天"}
-        if day_offset in mapping:
-            return mapping[day_offset]
-        weekday = "一二三四五六日"[day.weekday()]
-        return f"{day:%m-%d}（周{weekday}）"
+    @staticmethod
+    def _hours_from_offset(offset: int) -> int:
+        """`-N` 参数 → 时间窗小时数：默认 24 小时，每 +1 再加 24 小时。"""
+        return 24 * (max(0, int(offset)) + 1)
+
+    @staticmethod
+    def _window_short(hours: int) -> str:
+        """简短时间窗描述：近 24 小时 / 近 96 小时（4 天）。"""
+        hours = max(1, int(hours))
+        days, rest = divmod(hours, 24)
+        if days >= 2 and rest == 0:
+            return f"近 {hours} 小时（{days} 天）"
+        return f"近 {hours} 小时"
 
     @staticmethod
     def _subject_name(item: dict) -> tuple[str, str]:
@@ -378,7 +387,12 @@ class BangumiGroupPlugin(Star):
         name = subject.get("name_cn") or subject.get("name") or f"#{item.get('subject_id')}"
         return str(name), SUBJECT_LABEL.get(item.get("subject_type"), "")
 
-    def _format_item(self, item: dict, with_date: bool = False) -> str:
+    def _format_item(self, item: dict, with_date: bool | str = False) -> str:
+        """渲染单条动态。
+
+        with_date: True 恒定显示月日；False 只显示钟点；
+                   "auto" 跨天（不是今天）才显示月日，滚动窗口下用这个。
+        """
         name, kind = self._subject_name(item)
         bits: list[str] = []
 
@@ -397,7 +411,10 @@ class BangumiGroupPlugin(Star):
         stamp = self._parse_iso(item.get("updated_at"))
         if stamp:
             local = stamp.astimezone(self.tz)
-            clock = f"{local:%m-%d %H:%M} " if with_date else f"{local:%H:%M} "
+            show_date = bool(with_date)
+            if with_date == "auto":
+                show_date = local.date() != self._now().date()
+            clock = f"{local:%m-%d %H:%M} " if show_date else f"{local:%H:%M} "
         else:
             clock = ""
         prefix = f"[{kind}] " if kind else ""
@@ -511,9 +528,11 @@ class BangumiGroupPlugin(Star):
         return parts
 
     @staticmethod
-    def _parse_day_offset(args: list[str]) -> tuple[int, list[str]]:
-        """从参数里挑出 -N 天数偏移，返回 (offset, 剩余参数)。
+    def _parse_offset(args: list[str]) -> tuple[int, list[str]]:
+        """从参数里挑出 -N 时间窗偏移，返回 (offset, 剩余参数)。
 
+        offset 不再表示「往前第几天」，而是时间窗的档位：
+        0（默认）= 近 24 小时，每 +1 再加 24 小时。
         兼容全角减号、中文破折号，以及 `- 3` 这类被空格分开的写法。
         """
         offset = 0
@@ -599,28 +618,28 @@ class BangumiGroupPlugin(Star):
 
     # ── 渲染 ────────────────────────────────────────────────
 
-    async def _render_user_day(
-        self, username: str, title: str, day_offset: int = 0
+    async def _render_user_recent(
+        self, username: str, title: str, hours: int = 24
     ) -> str:
-        day_label = self._day_label(day_offset)
+        """渲染某位群友近 hours 小时的动态（滚动时间窗）。"""
+        window = self._window_short(hours)
         try:
-            items = await self._fetch_collections(username, day_offset)
+            items = await self._fetch_collections(username, hours)
         except UserNotFound:
             return f"❌ 找不到 Bangumi 用户「{username}」，可能已改名或注销。"
         except BangumiError as exc:
             return f"❌ 查询「{username}」失败：{exc}"
 
-        day_items = self._day_items(items, day_offset)
-        if not day_items:
-            return f"📭 {title}{day_label}没有新动态。"
+        recent = self._recent_items(items, hours)
+        if not recent:
+            return f"📭 {title}{window}没有新动态。"
 
-        # 查历史日期时附上具体日期，避免同一个钟点看不出是哪天
-        with_date = day_offset > 0
-        lines = [f"📖 {title}{day_label}有 {len(day_items)} 条动态："]
-        for item in day_items[:MAX_ITEMS_PER_USER]:
-            lines.append("  · " + self._format_item(item, with_date=with_date))
-        if len(day_items) > MAX_ITEMS_PER_USER:
-            lines.append(f"  …… 还有 {len(day_items) - MAX_ITEMS_PER_USER} 条")
+        # 窗口可能跨天，跨天的条目自动补上日期，避免同一个钟点分不清是哪天
+        lines = [f"📖 {title}{window}有 {len(recent)} 条动态："]
+        for item in recent[:MAX_ITEMS_PER_USER]:
+            lines.append("  · " + self._format_item(item, with_date="auto"))
+        if len(recent) > MAX_ITEMS_PER_USER:
+            lines.append(f"  …… 还有 {len(recent) - MAX_ITEMS_PER_USER} 条")
         return "\n".join(lines)
 
     # ── 命令 ────────────────────────────────────────────────
@@ -687,7 +706,7 @@ class BangumiGroupPlugin(Star):
         yield event.plain_result(
             f"✅ 绑定成功\n"
             f"   你的 Bangumi：{display}（用户名 {username}）\n"
-            f"   之后发 /bgm我 就能看今天的追番动态。"
+            f"   之后发 /bgm我 就能看近 24 小时的追番动态。"
         )
 
     @filter.command("bgm解绑", alias={"bgm_unbind", "解绑bgm"})
@@ -720,29 +739,32 @@ class BangumiGroupPlugin(Star):
             )
             return
         self._refresh_qq_name(event, binding)
-        day_offset, _ = self._parse_day_offset(self._args(event))
+        offset, _ = self._parse_offset(self._args(event))
+        hours = self._hours_from_offset(offset)
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
-            await self._render_user_day(binding["username"], f"你（{label}）", day_offset)
+            await self._render_user_recent(binding["username"], f"你（{label}）", hours)
         )
 
     @filter.command("bgm查", alias={"bgm_query"})
     async def query(self, event: AstrMessageEvent):
         scope = self._scope_id(event)
         target = self._extract_target_id(event)
-        day_offset, args = self._parse_day_offset(self._args(event))
+        offset, args = self._parse_offset(self._args(event))
+        hours = self._hours_from_offset(offset)
 
         if not target:
             if not args:
                 yield event.plain_result(
                     "用法：/bgm查 @群友 [-N]   或   /bgm查 <Bangumi 用户名> [-N]\n"
-                    "N 可选：-0 今天（默认）、-1 昨天、-2 前天……依次递推"
+                    "N 可选：默认近 24 小时；-1 近 48 小时；-2 近 72 小时……"
+                    "每 +1 多 24 小时"
                 )
                 return
             keyword = args[0].strip().lstrip("@")
             # 无 @ 时直接按 Bangumi 用户名/UID 搜索（不要求绑定）
             yield event.plain_result(
-                await self._render_user_day(keyword, f"{keyword} ", day_offset)
+                await self._render_user_recent(keyword, f"{keyword} ", hours)
             )
             return
 
@@ -753,15 +775,14 @@ class BangumiGroupPlugin(Star):
         self._refresh_qq_name(event, binding)
         label = binding.get("display") or binding["username"]
         yield event.plain_result(
-            await self._render_user_day(binding["username"], f"{label} ", day_offset)
+            await self._render_user_recent(binding["username"], f"{label} ", hours)
         )
 
     @filter.command("bgm群报", alias={"bgm_group", "群报"})
     async def group_report(self, event: AstrMessageEvent):
         scope = self._scope_id(event)
-        raw_args = self._args(event)
-        day_offset, _ = self._parse_day_offset(raw_args)
-        legacy = bool(raw_args)  # 显式带参数 → 按自然日（兼容 /bgm群报 -N 历史查询）
+        offset, _ = self._parse_offset(self._args(event))
+        hours = self._hours_from_offset(offset)
 
         bindings = self._list_bindings(scope)
         if not bindings:
@@ -770,31 +791,20 @@ class BangumiGroupPlugin(Star):
             )
             return
 
-        window_text = self._day_label(day_offset) if legacy else "近 24 小时"
         yield event.plain_result(
-            f"🔍 正在统计 {len(bindings)} 位群友{window_text}的动态…"
+            f"🔍 正在统计 {len(bindings)} 位群友{self._window_short(hours)}的动态…"
         )
+        yield event.chain_result([Nodes(await self._build_report_nodes(scope, hours))])
 
-        nodes = (
-            await self._build_report_nodes(scope, day_offset=day_offset)
-            if legacy
-            else await self._build_report_nodes(scope)
-        )
-        yield event.chain_result([Nodes(nodes)])
-
-    async def _build_report_nodes(
-        self, scope: str, day_offset: int | None = None, hours: int = 24
-    ) -> list[Node]:
+    async def _build_report_nodes(self, scope: str, hours: int = 24) -> list[Node]:
         """构建群报节点：每位绑定群友一条，最后合并为转发消息。
 
-        day_offset=None（默认）→ 滚动窗口「近 hours 小时」，
-          对应「上次推送时刻 → 本次推送时刻」的更新；
-        传 day_offset → 按自然日统计（兼容 /bgm群报 -N）。
+        统计口径统一为滚动时间窗「近 hours 小时」：
+          定时推送时正好对应「上次推送时刻 → 本次推送时刻」的更新；
+          手动 /bgm群报 -N 则按 24×(N+1) 小时放大窗口。
         """
-        rolling = day_offset is None
-        short_label = f"近 {hours} 小时" if rolling else self._day_label(int(day_offset))
-        full_label = self._recent_label(hours) if rolling else self._day_label(int(day_offset))
-        depth = 1 if rolling else int(day_offset)
+        short_label = self._window_short(hours)
+        full_label = self._recent_label(hours)
         bindings = self._list_bindings(scope)
         if not bindings:
             return []
@@ -818,7 +828,7 @@ class BangumiGroupPlugin(Star):
             label = binding.get("display") or binding["username"]
             uin = str(binding.get("user_id") or "0")
             try:
-                items = await self._fetch_collections(binding["username"], depth)
+                items = await self._fetch_collections(binding["username"], hours)
             except UserNotFound:
                 nodes.append(
                     Node(
@@ -838,20 +848,18 @@ class BangumiGroupPlugin(Star):
                 )
                 continue
 
-            day_items = (
-                self._recent_items(items, hours)
-                if rolling
-                else self._day_items(items, int(day_offset))
-            )
-            if not day_items:
+            recent = self._recent_items(items, hours)
+            if not recent:
                 text = f"📭 {label} · {short_label}没有新动态"
             else:
-                lines = [f"📖 {label} · {short_label}有 {len(day_items)} 条动态"]
-                for item in day_items[:MAX_ITEMS_PER_USER_IN_REPORT]:
-                    lines.append(self._format_item(item))
-                if len(day_items) > MAX_ITEMS_PER_USER_IN_REPORT:
+                lines = [f"📖 {label} · {short_label}有 {len(recent)} 条动态"]
+                # 窗口超过 24 小时时补日期，否则同一个钟点分不清是哪天
+                with_date = hours > 24
+                for item in recent[:MAX_ITEMS_PER_USER_IN_REPORT]:
+                    lines.append(self._format_item(item, with_date=with_date))
+                if len(recent) > MAX_ITEMS_PER_USER_IN_REPORT:
                     lines.append(
-                        f"…… 还有 {len(day_items) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
+                        f"…… 还有 {len(recent) - MAX_ITEMS_PER_USER_IN_REPORT} 条"
                     )
                 text = "\n".join(lines)
             nodes.append(Node(content=[Plain(text)], name=label, uin=uin))
@@ -961,7 +969,7 @@ class BangumiGroupPlugin(Star):
         )
 
         season_ids: set[str] | None = None
-        depth = {0: 0, 1: 7}.get(kind, 0)
+        depth_days = {0: 0, 1: 7}.get(kind, 0)
         if kind == 2:
             try:
                 season_ids = await self._fetch_season_ids()
@@ -970,14 +978,16 @@ class BangumiGroupPlugin(Star):
             if not season_ids:
                 yield event.plain_result("❌ 取当季放送表失败，请稍后再试。")
                 return
-            depth = min(130, max(7, (self._now() - self._season_start()).days + 1))
+            depth_days = min(130, max(7, (self._now() - self._season_start()).days + 1))
+        # 排名仍按自然日窗口统计，这里只是换算成「要拉多深」的滚动小时数
+        fetch_hours = max(24, (depth_days + 1) * 24)
 
         stats: dict[str, dict] = {}
         failed: list[str] = []
         for index, binding in enumerate(bindings):
             label = binding.get("display") or binding["username"]
             try:
-                items = await self._fetch_collections(binding["username"], depth)
+                items = await self._fetch_collections(binding["username"], fetch_hours)
             except UserNotFound:
                 failed.append(label)
                 continue
