@@ -77,6 +77,7 @@ HELP_TEXT = """Bangumi 群友动态
 时间窗参数：以上查询命令都可加 -N 扩大时间窗
   默认（不加）= 近 24 小时，-1 = 近 48 小时，-2 = 近 72 小时……
   每 +1 多 24 小时，即 -N 表示「近 24×(N+1) 小时」
+  -N 也可以紧跟名字写：/bgm查 @群友-3 与 /bgm查 @群友 -3 效果相同
   例如：/bgm我 -1        /bgm查 @群友 -3（近 96 小时）      /bgm群报 -2
 
 ⚠️ 口径说明（重要）
@@ -751,7 +752,6 @@ class BangumiGroupPlugin(Star):
         scope = self._scope_id(event)
         target = self._extract_target_id(event)
         offset, args = self._parse_offset(self._args(event))
-        hours = self._hours_from_offset(offset)
 
         if not target:
             if not args:
@@ -762,9 +762,35 @@ class BangumiGroupPlugin(Star):
                 )
                 return
             keyword = args[0].strip().lstrip("@")
-            # 无 @ 时直接按 Bangumi 用户名/UID 搜索（不要求绑定）
+            # ① 先按本群群友解析（QQ 昵称 / Bangumi 昵称 / 用户名），
+            #    这样纯文本 @ 昵称（aiocqhttp 拿不到 QQ 号）也能查到人
+            binding = self._find_binding_by_keyword(scope, keyword) if keyword else None
+            if binding is None and keyword:
+                # ② 兼容 `@day-3` 这种把时间窗直接粘在名字后面的写法：
+                #    只有当后半截是数字、且前半截能匹配到本群群友时才拆
+                glued = re.fullmatch(r"(.+?)[-－—–](\d{1,2})", keyword)
+                if glued:
+                    base = glued.group(1).strip()
+                    binding = self._find_binding_by_keyword(scope, base) if base else None
+                    if binding is not None:
+                        keyword = base
+                        # 显式写了 -N 就以显式为准
+                        if offset == 0:
+                            offset = int(glued.group(2))
+            if binding is not None:
+                self._refresh_qq_name(event, binding)
+                label = binding.get("display") or binding["username"]
+                yield event.plain_result(
+                    await self._render_user_recent(
+                        binding["username"], f"{label} ", self._hours_from_offset(offset)
+                    )
+                )
+                return
+            # ③ 本群没有这位群友的绑定 → 直接当 Bangumi 用户名 / UID 查
             yield event.plain_result(
-                await self._render_user_recent(keyword, f"{keyword} ", hours)
+                await self._render_user_recent(
+                    keyword, f"{keyword} ", self._hours_from_offset(offset)
+                )
             )
             return
 
@@ -1041,17 +1067,20 @@ class BangumiGroupPlugin(Star):
             lines.append(f"（查询失败：{'、'.join(failed)}）")
         yield event.plain_result("\n".join(lines))
 
-    @filter.regex(r"^/?bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助)\S+$")
+    @filter.regex(r"^/?bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助)(?!\s).+$")
     async def nospace_dispatch(self, event: AstrMessageEvent):
-        """兼容漏打空格的写法（如 /bgm绑定xxx、/bgm查mzfl）。
+        """兼容漏打空格的写法（如 /bgm绑定xxx、/bgm查@day -3）。
 
         AstrBot 的标准指令匹配要求「指令名 + 空格」或整串相等
         （core/star/filter/command.py: startswith(cmd + " ")），
         漏空格时命令不会被调用。这里用正则兜住，补空格后转交对应指令。
+
+        正则里 `(?!\\s)` 是关键：只兜「指令名后面紧跟非空白」的写法，
+        已经规范写成 `/bgm查 @day` 的不会再被这条规则重复处理（否则会回两次）。
         """
         text = (event.message_str or "").strip()
         m = re.match(
-            r"^/?(bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助))(\S+)$", text
+            r"^/?(bgm(?:绑定|解绑|群报订阅|群报|查|我|排名|帮助))(?!\s)(\S.*)$", text
         )
         if not m:
             return
